@@ -182,6 +182,8 @@ def run_multicard_smoke_test(
     # as a PyTorch backend at import time; importing it before torch triggers a
     # circular import error.
     import torch  # noqa: F401  — must precede any torch_spyre import
+    import torch.distributed as dist
+    from torch.profiler import ProfilerActivity, profile
     from transformers import AutoTokenizer
 
     from hf_adapters import AutoSpyreModelForCausalLM
@@ -313,7 +315,15 @@ def run_multicard_smoke_test(
     print(f"\n{'=' * 20} Run Model...")
     gen_t0 = time.time()
     try:
-        output_texts, captured = _run_generate()
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            record_shapes=True,
+        ) as prof:
+            output_texts, captured = _run_generate()
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        prof.export_chrome_trace(f"trace_rank_{rank}.json")
+
         result["gen_s"] = time.time() - gen_t0
 
         ttft, decode, per_token = _parse_timing(captured)

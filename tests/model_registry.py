@@ -42,6 +42,17 @@ def _include_gated() -> bool:
     return os.getenv("SPYRE_INCLUDE_GATED", "0") == "1"
 
 
+def _include_trust_remote_code() -> bool:
+    """Whether ``trust_remote_code`` models should be included in test lists.
+
+    Some checkpoints (e.g. bharatgenai/Param-1-5B) ship custom modelling code on
+    the Hub and only load with ``trust_remote_code=True``. We do not run them
+    implicitly in CI so they are excluded by default.
+    Set ``SPYRE_INCLUDE_TRUST_REMOTE_CODE=1`` to opt them in.
+    """
+    return os.getenv("SPYRE_INCLUDE_TRUST_REMOTE_CODE", "0") == "1"
+
+
 # Model registries - shared by all tests
 CAUSAL_LM_MODELS = {
     # hf_gpt2.py
@@ -248,6 +259,13 @@ CAUSAL_LM_MODELS = {
         "adapter": "hf_olmo2.py",
         "size": "1b",
     },
+    # hf_olmoe.py
+    "olmoe_1b_7b": {
+        "name": "OLMoE 1B-7B",
+        "path": "allenai/OLMoE-1B-7B-0924",
+        "adapter": "hf_olmoe.py",
+        "size": "7b",
+    },
     # hf_gemma2.py
     "gemma2_2b_unsloth": {
         "name": "Gemma 2 2B",
@@ -358,6 +376,14 @@ CAUSAL_LM_MODELS = {
         "size": "1b",
         "kind": "dspark_draft",
     },
+    "diffusiongemma_26b": {
+        "name": "DiffusionGemma 26B-A4B-it",
+        "path": "google/diffusiongemma-26B-A4B-it",
+        "adapter": "hf_diffusion_gemma.py",
+        "size": "26b",
+        "dtype": "bfloat16",
+        "kind": "diffusion",  # not AR; uses block-diffusion generate loop
+    },
 }
 
 EMBEDDING_MODELS = {
@@ -368,6 +394,12 @@ EMBEDDING_MODELS = {
         "adapter": "hf_gemma3.py",
         "is_gated": True,
         "size": "0.3b",
+    },
+    "unsloth_embeddinggemma": {
+        "name": "Non-gated EmbeddingGemma",
+        "path": "unsloth/embeddinggemma-300m",
+        "adapter": "hf_gemma3.py",
+        "size": "0.270b",
     },
     # hf_qwen3.py
     "qwen3_embed": {
@@ -605,17 +637,37 @@ VISION_MODELS = {
         "dtype": "bfloat16",  # blocked-FP8 checkpoint, dequantized to bf16
         "size": "3b",
     },
+    # hf_gemma4_vision.py — Vision tower of encoder-based Gemma4 models
+    "gemma4_vision_tower": {
+        "name": "Gemma 4 26B-A4B (Vision tower)",
+        "path": "google/gemma-4-26B-A4B-it",
+        "adapter": "hf_gemma4_vision.py",
+        "kind": "tower",
+    },
     # hf_gemma4_mm.py — unified encoder-free VLM (image + text -> text)
-    # Note: google/gemma-4-12b (base, no chat template) also resolves via this
-    # adapter (Gemma4UnifiedConfig -> hf_gemma4_mm) but is tested via the
-    # causal-LM path (gemma4_base in CAUSAL_LM_MODELS); the VLM harness requires
-    # apply_chat_template, which the base model does not provide.
     "gemma4_mm": {
         "name": "Gemma 4 12B IT (unified VLM)",
         "path": "google/gemma-4-12B-it",
         "adapter": "hf_gemma4_mm.py",
         "kind": "vlm",  # multimodal: image + text -> generated text
         "size": "12b",
+        "always_test": True,
+    },
+    "gemma4_e2b_mm": {
+        "name": "Gemma 4 E2B (VLM with PLE)",
+        "path": "google/gemma-4-E2B-it",
+        "adapter": "hf_gemma4_mm.py",
+        "kind": "vlm",
+        "size": "2b",
+        "always_test": True,
+    },
+    "gemma4_moe_mm": {
+        "name": "Gemma 4 26B-A4B (MoE VLM)",
+        "path": "google/gemma-4-26B-A4B-it",
+        "adapter": "hf_gemma4_mm.py",
+        "kind": "vlm",
+        "size": "26b",
+        "always_test": True,
     },
     # hf_clip.py — CLIP dual-encoder (image + text -> embeddings via ST backend)
     "clip_vit_b_32": {
@@ -651,6 +703,7 @@ def _select_representative_paths(
     models: dict[str, dict],
     *,
     include_gated: bool,
+    include_trust_remote_code: bool | None = None,
     predicate=None,
 ) -> list[str]:
     """Select representative model paths for each adapter module.
@@ -658,13 +711,18 @@ def _select_representative_paths(
     Groups ``models`` by adapter and picks the smallest (by ``size``) model in
     each group, breaking ties by key name for determinism. Entries marked
     ``always_test`` are included in addition to that representative. Gated
-    models are skipped unless ``include_gated``. An optional
+    models are skipped unless ``include_gated``; ``trust_remote_code`` models are
+    skipped unless ``include_trust_remote_code``. An optional
     ``predicate(info) -> bool`` filters which entries are eligible (e.g.
     ``kind == "vlm"`` for vision).
     """
+    if include_trust_remote_code is None:
+        include_trust_remote_code = _include_trust_remote_code()
     adapter_to_keys: dict[str, list[str]] = {}
     for key, info in models.items():
         if info.get("is_gated", False) and not include_gated:
+            continue
+        if info.get("trust_remote_code", False) and not include_trust_remote_code:
             continue
         if predicate is not None and not predicate(info):
             continue
@@ -718,15 +776,19 @@ def _exclude(paths: list[str]) -> list[str]:
 # ``kind == "vlm"`` excludes bare vision towers.
 _include_gated_flag = _include_gated()
 
+
 # ``kind == "dspark_draft"`` entries are speculative-decoding drafters (block
 # proposers, driven by ``_run_draft_block`` — no ``generate``), so they are
 # registered for adapter-coverage but excluded from the generate-based CPU/Spyre
 # causal-LM harnesses; they are exercised by tests/spyre/test_dspark_draft_spyre.py.
+# ``kind == "diffusion"`` entries (e.g. DiffusionGemma) use a block-diffusion
+# generate loop that is incompatible with the AR causal-LM harness; they are
+# exercised by tests/spyre/test_diffusion_gemma.py.
 CAUSAL_PATHS: list[str] = _exclude(
     _select_representative_paths(
         CAUSAL_LM_MODELS,
         include_gated=_include_gated_flag,
-        predicate=lambda info: info.get("kind") != "dspark_draft",
+        predicate=lambda info: info.get("kind") not in ("dspark_draft", "diffusion"),
     )
 )
 MULTICARD_SMOKE_PATHS: list[str] = _exclude(
@@ -782,6 +844,7 @@ def _all_paths(
     models: dict[str, dict],
     *,
     include_gated: bool,
+    include_trust_remote_code: bool | None = None,
     predicate=None,
 ) -> list[str]:
     """All registered paths (no per-adapter reduction), for explicit selection.
@@ -791,12 +854,34 @@ def _all_paths(
     target a non-representative checkpoint, e.g. a larger model that shares an
     adapter with a smaller default.
     """
+    if include_trust_remote_code is None:
+        include_trust_remote_code = _include_trust_remote_code()
     return [
         info["path"]
         for info in models.values()
         if (include_gated or not info.get("is_gated", False))
+        and (include_trust_remote_code or not info.get("trust_remote_code", False))
         and (predicate is None or predicate(info))
     ]
+
+
+# Paths that must be loaded with ``trust_remote_code=True``
+# Spans all category registries so a single lookup covers any harness. Test
+# call sites check membership in ``REMOTE_CODE_PATHS`` to decide whether to
+# forward ``trust_remote_code=True`` to ``from_pretrained``.
+REMOTE_CODE_PATHS: frozenset[str] = frozenset(
+    info["path"]
+    for models in (
+        CAUSAL_LM_MODELS,
+        EMBEDDING_MODELS,
+        MASKED_LM_MODELS,
+        QUESTION_ANSWERING_MODELS,
+        TOKEN_CLASSIFICATION_MODELS,
+        VISION_MODELS,
+    )
+    for info in models.values()
+    if info.get("trust_remote_code", False)
+)
 
 
 # Every registered path per category, bypassing the smallest-per-adapter
@@ -807,7 +892,7 @@ ALL_CAUSAL_PATHS: list[str] = _exclude(
     _all_paths(
         CAUSAL_LM_MODELS,
         include_gated=_include_gated_flag,
-        predicate=lambda info: info.get("kind") != "dspark_draft",
+        predicate=lambda info: info.get("kind") not in ("dspark_draft", "diffusion"),
     )
 )
 ALL_EMBED_PATHS: list[str] = _exclude(
@@ -859,6 +944,7 @@ NON_BLOCKING_CAUSAL_MODELS: dict[str, str] = _non_blocking(
     (
         "smollm3",
         "gemma2_2b_unsloth",  # small gap that happens to flip token for test prompt
+        "olmoe_1b_7b",
     ),
 )
 
@@ -913,6 +999,12 @@ SEQ_CLASSIFICATION_MODELS = {
         "path": "distilbert/distilbert-base-uncased-finetuned-sst-2-english",
         "adapter": "hf_distilbert.py",
         "size": "0.07b",
+        "test_inputs": [
+            "This movie was fantastic.",
+            "This movie was absolutely terrible.",
+            "I loved every minute of it.",
+        ],
+        "expected_ids": [1, 0, 1],
     },
     # hf_xlm_roberta.py (RobertaConfig → same adapter as XLM-R / reranker)
     "roberta_mnli": {
@@ -920,8 +1012,41 @@ SEQ_CLASSIFICATION_MODELS = {
         "path": "FacebookAI/roberta-large-mnli",
         "adapter": "hf_xlm_roberta.py",
         "size": "0.36b",
+        "test_inputs": [
+            (
+                "The capital of France is Paris.",
+                "Paris is the capital of France.",
+            ),
+            ("A man is eating lunch.", "Nobody is eating."),
+            (
+                "A woman is reading a book.",
+                "The woman is reading a mystery novel.",
+            ),
+        ],
+        "expected_ids": [2, 0, 1],
     },
 }
+
+NON_BLOCKING_SEQUENCE_CLASSIFICATION_MODELS: dict[str, str] = _non_blocking(
+    SEQ_CLASSIFICATION_MODELS,
+    (),
+)
+
+
+def sequence_classification_test_case(
+    model_path: str,
+) -> tuple[list[str] | list[tuple[str, str]], list[int]]:
+    """Return task-appropriate inputs and expected labels for a classifier."""
+    normalized_path = model_path.lower().replace("\\", "/")
+    for model in SEQ_CLASSIFICATION_MODELS.values():
+        registered_path = model["path"].lower()
+        cache_path = registered_path.replace("/", "--")
+        if normalized_path == registered_path or cache_path in normalized_path:
+            return model["test_inputs"], model["expected_ids"]
+    raise ValueError(
+        f"No task-appropriate sequence-classification inputs registered for {model_path!r}"
+    )
+
 
 SEQ_CLASSIFICATION_PATHS: list[str] = _exclude(
     _select_representative_paths(
